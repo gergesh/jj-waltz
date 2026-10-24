@@ -7,6 +7,7 @@ pub mod jj;
 pub(crate) mod lifecycle;
 pub mod links;
 pub(crate) mod manager;
+pub(crate) mod merge;
 pub(crate) mod metadata;
 pub mod observe;
 pub(crate) mod ownership;

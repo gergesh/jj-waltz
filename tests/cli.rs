@@ -955,6 +955,257 @@ fn remove_batch_rejects_duplicate_workspace_before_mutating() {
     assert!(repo.workspace_names().contains(&"feature-a".to_owned()));
 }
 
+/// A `main` bookmark one revision ahead of a `feature-a` workspace holding two revisions.
+fn merge_fixture(feature_readme: Option<&str>) -> (TestRepo, PathBuf) {
+    let repo = TestRepo::new().expect("create test repo");
+    repo.run_jj(["bookmark", "create", "main", "-r", "@-"]);
+    repo.cmd()
+        .args(["add", "--bookmark", "wip/feature-a", "feature-a"])
+        .assert()
+        .success();
+    let feature = repo.default_root.with_extension("feature-a");
+    commit_file(&repo, &feature, "one.txt", "one\n", "feature one");
+    commit_file(
+        &repo,
+        &feature,
+        "README.md",
+        feature_readme.unwrap_or("hello\n"),
+        "feature two",
+    );
+    commit_file(&repo, &repo.default_root, "README.md", "trunk\n", "trunk");
+    repo.run_jj(["bookmark", "move", "main", "--to", "@-"]);
+    (repo, feature)
+}
+
+fn commit_file(repo: &TestRepo, root: &Path, file: &str, contents: &str, message: &str) {
+    fs::write(root.join(file), contents).expect("write committed file");
+    repo.run_in(root, ["jj", "file", "track", file])
+        .expect("track committed file");
+    repo.run_in(root, ["jj", "commit", "-m", message])
+        .expect("commit file");
+}
+
+fn main_history(repo: &TestRepo) -> Vec<String> {
+    history(repo, "::main ~ root()")
+}
+
+fn history(repo: &TestRepo, revset: &str) -> Vec<String> {
+    repo.jj_stdout(
+        &repo.default_root,
+        &[
+            "log",
+            "-r",
+            revset,
+            "--no-graph",
+            "-T",
+            "description.first_line() ++ \"\\n\"",
+        ],
+    )
+    .lines()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+#[test]
+fn merge_lands_workspace_on_bookmark_and_removes_it() {
+    skip_without_jj!();
+    let (repo, feature) = merge_fixture(None);
+
+    repo.cmd_at(&feature)
+        .args(["merge", "--into", "main"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Landed workspace feature-a into bookmark main: 2 revision(s)",
+        ))
+        .stdout(predicate::str::contains("Deleted bookmark: wip/feature-a"));
+
+    assert_eq!(
+        main_history(&repo),
+        ["feature two", "feature one", "trunk", "initial"]
+    );
+    assert!(!feature.exists());
+    assert!(!repo.workspace_names().contains(&"feature-a".to_owned()));
+    assert!(!repo.bookmarks().contains(&"wip/feature-a".to_owned()));
+    assert!(repo.metadata_record_paths().is_empty());
+}
+
+#[test]
+fn merge_squash_lands_one_revision_on_bookmark_and_prints_path() {
+    skip_without_jj!();
+    let (repo, feature) = merge_fixture(None);
+
+    let output = repo
+        .cmd_at(&feature)
+        .args(["merge", "--squash", "--print-path", "--into", "main"])
+        .output()
+        .expect("execute jw merge");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("Landed workspace feature-a into bookmark main: 1 revision(s), squashed")
+    );
+    assert_eq!(
+        PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()),
+        repo.default_root
+    );
+
+    assert_eq!(main_history(&repo), ["feature one", "trunk", "initial"]);
+    let description = repo.jj_stdout(
+        &repo.default_root,
+        &["log", "-r", "main", "--no-graph", "-T", "json(description)"],
+    );
+    assert_eq!(description, r#""feature one\n\nfeature two\n""#);
+    assert!(!feature.exists());
+}
+
+#[test]
+fn merge_stops_on_rebase_conflicts_and_keeps_workspace() {
+    skip_without_jj!();
+    let (repo, feature) = merge_fixture(Some("feature\n"));
+    let trunk = repo.jj_stdout(
+        &repo.default_root,
+        &["log", "-r", "main", "--no-graph", "-T", "commit_id"],
+    );
+
+    repo.cmd_at(&feature)
+        .args(["merge", "--into", "main"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("left 1 conflicted revision(s)"))
+        .stderr(predicate::str::contains("jj op restore"));
+
+    assert_eq!(
+        repo.jj_stdout(
+            &repo.default_root,
+            &["log", "-r", "main", "--no-graph", "-T", "commit_id"],
+        ),
+        trunk
+    );
+    assert!(feature.is_dir());
+    assert!(repo.workspace_names().contains(&"feature-a".to_owned()));
+    assert!(repo.bookmarks().contains(&"wip/feature-a".to_owned()));
+}
+
+#[test]
+fn merge_rerun_after_landing_only_removes_workspace() {
+    skip_without_jj!();
+    let (repo, feature) = merge_fixture(None);
+    repo.run_in(&feature, ["jj", "rebase", "-b", "@", "-d", "main"])
+        .expect("rebase feature");
+    repo.run_in(&feature, ["jj", "bookmark", "move", "main", "--to", "@-"])
+        .expect("land feature by hand");
+
+    repo.cmd_at(&feature)
+        .args(["merge", "--into", "main"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Workspace feature-a was already in bookmark main",
+        ));
+
+    assert_eq!(
+        main_history(&repo),
+        ["feature two", "feature one", "trunk", "initial"]
+    );
+    assert!(!feature.exists());
+}
+
+#[test]
+fn merge_refuses_default_workspace_and_missing_bookmark() {
+    skip_without_jj!();
+    let (repo, feature) = merge_fixture(None);
+
+    repo.cmd()
+        .args(["merge", "--into", "main"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "refusing to merge the default workspace",
+        ));
+    repo.cmd_at(&feature)
+        .args(["merge", "--into", "nope"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "local bookmark does not exist: nope",
+        ));
+
+    assert!(feature.is_dir());
+    assert!(repo.workspace_names().contains(&"feature-a".to_owned()));
+}
+
+#[test]
+fn merge_named_workspace_inserts_it_before_current_working_copy() {
+    skip_without_jj!();
+    let (repo, feature) = merge_fixture(None);
+    fs::write(repo.default_root.join("wip.txt"), "wip\n").expect("write uncommitted work");
+    repo.run_jj(["file", "track", "wip.txt"]);
+
+    let output = repo
+        .cmd()
+        .args(["merge", "feature-a", "--print-path"])
+        .output()
+        .expect("execute jw merge");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("Landed workspace feature-a into workspace default: 2 revision(s)"));
+    assert_eq!(
+        PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()),
+        repo.default_root
+    );
+
+    // The uncommitted work stays on top, the current workspace stays fresh, and no bookmark
+    // moves without --into.
+    assert_eq!(
+        history(&repo, "::@- ~ root()"),
+        ["feature two", "feature one", "trunk", "initial"]
+    );
+    assert_eq!(
+        repo.jj_stdout(&repo.default_root, &["diff", "--name-only"]),
+        "wip.txt"
+    );
+    assert_eq!(main_history(&repo), ["trunk", "initial"]);
+    assert!(!feature.exists());
+    assert!(!repo.bookmarks().contains(&"wip/feature-a".to_owned()));
+}
+
+#[test]
+fn merge_current_workspace_inserts_it_into_default_workspace() {
+    skip_without_jj!();
+    let (repo, feature) = merge_fixture(None);
+
+    let output = repo
+        .cmd_at(&feature)
+        .args(["merge", "--print-path"])
+        .output()
+        .expect("execute jw merge");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert_eq!(
+        PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()),
+        repo.default_root
+    );
+    assert_eq!(
+        history(&repo, "::@- ~ root()"),
+        ["feature two", "feature one", "trunk", "initial"]
+    );
+    assert!(!feature.exists());
+}
+
+#[test]
+fn merge_push_requires_a_bookmark() {
+    skip_without_jj!();
+    let (repo, feature) = merge_fixture(None);
+
+    repo.cmd()
+        .args(["merge", "feature-a", "--push"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--into <BOOKMARK>"));
+    assert!(feature.is_dir());
+}
+
 #[test]
 fn clap_completion_combines_cli_metadata_and_workspace_candidates() {
     skip_without_jj!();

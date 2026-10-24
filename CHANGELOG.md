@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add `jw merge [workspace] [--into bookmark] [--squash] [--push]`, which lands a
+  workspace's stack and then removes the workspace, its directory, and its
+  associated bookmark. By default the stack is inserted before the current
+  workspace's `@` (the default workspace's when merging the current one) without
+  moving bookmarks; `--into` rebases onto a bookmark and advances it. Merging the
+  current workspace moves the shell to the default workspace. Conflicts and push
+  failures keep the workspace; reruns do not land work twice.
 - Prefer native `jj workspace remove` when the executable advertises it (JJ 0.46+),
   snapshotting dirty target changes before deletion while retaining ownership,
   manager review gates, unrelated Git registrations, and older-JJ fallback.

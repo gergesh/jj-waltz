@@ -21,6 +21,7 @@ const REVISION_TEMPLATE: &str =
 const LOCAL_BOOKMARK_NAMES_TEMPLATE: &str = r#"if(remote, "", json(name) ++ "\n")"#;
 const BOOKMARK_NAMES_TEMPLATE: &str = r#"json(name) ++ "\n""#;
 const TRACKED_FILES_TEMPLATE: &str = r#"json(path) ++ "\n""#;
+const DESCRIPTIONS_TEMPLATE: &str = r#"json(description) ++ "\n""#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JjVersion {
@@ -607,6 +608,25 @@ impl JjClient {
         Ok(parse_json_string_lines(output.stdout()?, "bookmark name")?
             .into_iter()
             .collect())
+    }
+
+    /// Read full revision descriptions, oldest first, at one frozen operation.
+    pub fn descriptions_at(
+        &self,
+        operation_id: impl AsRef<OsStr>,
+        revset: impl AsRef<OsStr>,
+    ) -> Result<Vec<String>> {
+        let args = [
+            OsString::from("log"),
+            OsString::from("-r"),
+            revset.as_ref().to_owned(),
+            OsString::from("--no-graph"),
+            OsString::from("--reversed"),
+            OsString::from("--template"),
+            OsString::from(DESCRIPTIONS_TEMPLATE),
+        ];
+        let output = self.run_at(operation_id, args)?;
+        parse_json_string_lines(output.stdout()?, "description")
     }
 
     /// Read conflicted bookmark names at one frozen repository operation.
