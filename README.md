@@ -18,6 +18,7 @@ JJ-native workspace lifecycle and cross-workspace coordination.
 The responsibility split is deliberate:
 
 - `jj` owns revision-graph work, bookmarks, fetch/push, and operation-log recovery.
+  `jw merge` is the one exception: it runs a fixed rebase-and-land sequence through `jj`.
 - `jw` owns workspace creation, navigation, links, lifecycle metadata, and safe
   cross-workspace coordination.
 - Forge tools such as `gh` and `glab` own pull requests, merge requests, and CI.
@@ -42,11 +43,13 @@ to a warning rather than make local workspace management fail.
 - `jw adopt <name> --base <revset>` records an existing workspace as managed without rewriting JJ state
 - `jw repair <name> --base <revset> (--bookmark <bookmark> | --no-bookmark)` repairs existing managed metadata without changing JJ state
 - `jw path`, `jw remove <name>...`, `jw prune`, `jw root`, and `jw current`
+- `jw merge [workspace]` lands a workspace before your `@` (or `--into` a bookmark), then removes it
 - `jw reconcile-external <name>` reconciles stale JJ state after external checkout cleanup
 - `--execute` support for jumping into editors or agents after switching
 - optional automatic bookmark creation for new workspaces
 - optional workspace links via `.jwlinks.toml` for sharing large ignored directories
-- optional copy-on-write workspace creation (`--cow`) on APFS, Btrfs, and XFS
+- optional copy-on-write workspace creation (`--cow`, or `--cow-all` to include
+  ignored files such as `node_modules`) on APFS, Btrfs, and XFS
 - shell integration for `fish`, `zsh`, `bash`, `elvish`, and `powershell`
 - generated shell completions from the CLI definition
 
@@ -135,27 +138,68 @@ is `SKIP`.
 `jw add --cow` and `jw switch --cow` fill a new workspace by cloning the current
 workspace's tracked files instead of letting JJ write each one. Clones share
 storage until either copy changes: APFS `clonefile(2)` on macOS and reflinks on
-Linux filesystems such as Btrfs and XFS. Creation is typically several times
-faster, and a new workspace uses almost no extra disk space. Enable it for every
-new workspace in config, and use `--no-cow` to opt out for one command:
+Linux filesystems such as Btrfs and XFS. Directories whose entries are all
+cloned are cloned whole, which macOS does in one system call, so creation takes
+about a second even for large checkouts, and a new workspace uses almost no extra
+disk space.
+
+`--cow-all` clones everything in the current workspace instead, including
+ignored and untracked files such as `node_modules`, build output, and `.env`, so
+a new workspace is ready to run without reinstalling dependencies. Enable either
+scope for every new workspace in config, and use `--no-cow` to opt out for one
+command:
 
 ```toml
 [workspace]
-copy_on_write = true
+copy_on_write = "tracked"  # or "all"; `true` means "tracked"
 ```
 
-The result matches an ordinary JJ checkout of the creation base, including the
-current workspace’s sparse patterns. Only files JJ tracks are cloned, so
-ignored and untracked files such as `.env` or `node_modules` never reach the new
-workspace; use [workspace links](#workspace-links) to share those. JJ adopts the
-clone with the current workspace's working-copy state, then `jw` restores `@` from
-its parent, so uncommitted edits in the current workspace never leak into the new
-one.
+Tracked files match an ordinary JJ checkout of the creation base, including the
+current workspace’s sparse patterns. With `--cow`, ignored and untracked files
+such as `.env` or `node_modules` never reach the new workspace; use workspace
+links or `--cow-all` to share those. JJ adopts the clone with the current
+workspace's working-copy state, then `jw` restores `@` from its parent, so
+uncommitted edits to tracked files in the current workspace never leak into the
+new one.
 
 When the filesystem cannot clone, `jw` warns and uses ordinary JJ workspace
 creation. With Watchman configured, or if JJ rejects the copied working-copy
-state, `jw` also recreates through the ordinary path. Every fallback preserves
-the current workspace’s sparse patterns.
+state, `jw` also recreates through the ordinary path without a warning. Every
+fallback preserves the current workspace’s sparse patterns, and every fallback is
+an ordinary checkout: with `--cow-all`, ignored and untracked files are then not
+carried over.
+
+### Links or `--cow-all`?
+
+[Workspace links](#workspace-links) and `--cow-all` both bring files JJ does not
+track into a new workspace, with opposite sharing:
+
+- A link shares one mutable target across workspaces. A write through any
+  workspace is visible in all of them, and there is one copy on disk. Use links
+  for large data or caches every workspace should see the same way.
+- `--cow-all` gives each workspace an independently writable copy. Writes stay in
+  that workspace, and storage is shared only until a block changes. Use it for
+  dependencies and build output that diverge per branch, such as `node_modules`.
+
+They combine: with `--cow-all`, a link source is not cloned when the link will
+supply it, that is when its target already exists outside the new workspace. A
+source whose target lies inside the new workspace, such as a private override
+with `target` equal to `source`, is cloned like any other path. A source whose
+optional target is missing is not cloned either, because a private copy there
+would be a link conflict; `jw` warns that it skipped it.
+
+Know what `--cow-all` copies:
+
+- Secrets such as `.env` and `.dev.vars` are copied into every new workspace as
+  independent files. Rotating a secret in one workspace does not update the
+  others; make such files link sources if they should have one source of truth.
+- Symlinks are copied as symlinks with their targets unchanged. A relative
+  symlink resolves from the new workspace; an absolute one keeps pointing at the
+  same place, which may be inside the current workspace.
+- Untracked files that are not ignored are cloned, then JJ's snapshot in the new
+  workspace tracks them and `jw` restoring `@` removes them again, like any other
+  uncommitted change. Only files JJ does not snapshot, because they are ignored
+  or excluded from `snapshot.auto-track`, stay in the new workspace.
 
 ## Shell setup
 
@@ -273,6 +317,83 @@ review. Independent rows continue after a failure; results identify partial
 progress, and failed rows remain selected for an explicit retry. No batch rollback
 or automatic repair is performed.
 
+## Merging workspaces
+
+`jw merge` lands a workspace's work and retires the workspace in one step. Like
+`git merge`, it brings the named workspace into where you are:
+
+```bash
+jw merge feature-api                # insert feature-api's work before your @
+jw merge                            # from inside a workspace: insert it before the default workspace's @
+jw merge feature-api --into main    # rebase onto main instead, and advance main
+jw merge feature-api --squash       # combine the workspace's revisions into one first
+jw merge feature-api --into main --push
+jw merge feature-api --keep-dir     # land and forget it, but leave its directory
+jw merge feature-api --force        # delete its directory even if untracked files would be lost
+```
+
+The landed work is the workspace's publish tip (a non-empty `@`, otherwise its sole
+parent) and every ancestor not already in the destination. By default it is inserted
+between the receiving workspace's `@` and its parent, as `jj rebase -B @` would, so
+uncommitted work stays on top and no bookmark moves. With `--into`, it is rebased onto
+the bookmark, which is fast-forwarded, and `--push` pushes it. Then the merged
+workspace and its directory are removed, along with its associated bookmark when that
+bookmark points into the landed work. The `--into` target, trunk bookmarks, and
+bookmarks pointing anywhere else, such as one associated with trunk through `jw repair`,
+are kept with a warning. Merging the current workspace moves the shell to the default
+workspace.
+
+Deleting the directory loses every file JJ does not track, so `jw merge` only deletes
+the ones you have marked regenerable. Mark them in your ignore files: a `# jw:trash` line
+starts a trash section, which runs until the next blank line or `# jw:` line.
+
+```gitignore
+# jw:trash
+target/
+node_modules/
+*.log
+
+# Everything else stays precious, including rules appended later.
+.env*
+```
+
+Every other untracked file is precious: one ignored by a rule outside a trash section,
+such as a local secret, and one JJ leaves untracked although it is not ignored, such as
+a file `snapshot.auto-track` excludes or one too large to snapshot. Before changing
+anything, `jw merge` refuses if any precious file has no identical copy at the same path
+in the default workspace, and lists each one with the ignore file, line, and pattern that
+decided it. Copies cloned from the default workspace, as `jw add --cow-all` creates,
+count as identical. Move regenerable patterns into a trash section, pass `--keep-dir` to
+land and forget the workspace while keeping its directory, pass `-f`/`--force` to skip
+the check and delete the directory with those files, or delete or move the listed files
+and rerun.
+
+Some tools write their own `.gitignore` inside a directory that also holds source you
+track, and rewrite it on every run. inlang's `project.inlang/.gitignore` is `*` with
+exceptions for its settings. You cannot keep a marker in such a file, and no rule above
+it can override it, because Git lets the deepest ignore file decide. Adopt it instead
+from a `.gitignore` in a directory above it, with a path relative to that directory:
+
+```gitignore
+# jw:trash-rules project.inlang/.gitignore
+```
+
+Every ignoring rule in an adopted file is trash; its negations still re-include files,
+which JJ then tracks. Only adopt a file whose rules cover nothing but regenerable files.
+When merge refuses over a rule in an untracked nested `.gitignore`, it suggests the line.
+
+Trash sections work in every ignore file Git and JJ read: `.gitignore` in any directory,
+the Git directory's `info/exclude`, and `core.excludesFile`, so personal trash such as
+`.DS_Store` can live in your global ignore file. `jw merge` asks Git which rule decides
+each path (`git check-ignore`), so it needs `git` on `PATH` unless you pass `--keep-dir` or `--force`.
+
+`jw merge` refuses the default workspace, conflicted or divergent working copies, merge
+commits, conflicted revisions, and directories holding precious untracked files (unless
+`--force` is passed).
+Removal is planned before any rewrite, so these refusals change nothing. If landing leaves conflicts, or the push fails, the workspace
+is kept; resolve the problem and rerun `jw merge`. Work already landed is not landed
+twice. A conflicted landing names the `jj op restore` operation that undoes it.
+
 ## Removing workspaces
 
 When a workspace has a bookmark created by `jw`, `jw remove` asks before deleting
@@ -284,18 +405,18 @@ jw remove --keep-bookmark feature-api
 ```
 
 Removal is planned before mutation, so default/current-workspace checks and bookmark
-choices happen before cleanup. On JJ 0.46+ or a build advertising `workspace remove`,
-directory removal uses that native command to snapshot the target's tracked changes
-before deletion. A stale target fails safely; inspect it and run `jj workspace
-update-stale` there before retrying. Older supported JJ versions use guarded forgetting
-and directory deletion. `--keep-dir` and already-missing directories use forgetting;
-`--keep-dir` preserves files. Ignored and other files outside JJ's snapshot are deleted
-with the directory, as before; use `--keep-dir` when they need preservation. The
-interactive manager still requires review of ignored/untracked files.
+choices happen before cleanup. Before deleting a directory, jw snapshots the target
+working copy, so its tracked and new files survive in the workspace's last commit. A
+stale target fails safely before anything changes; inspect it and run `jj workspace
+update-stale` there before retrying. jw then forgets the workspace, moves the
+directory aside, and deletes it in the background, so removing a checkout with large
+dependency trees returns immediately. `--keep-dir` and already-missing directories
+only forget; `--keep-dir` preserves files. Ignored and other files outside JJ's
+snapshot are deleted with the directory, as before; use `--keep-dir` when they need
+preservation. The interactive manager still requires review of ignored/untracked files.
 
-Native errors are checked for partial progress and never trigger a deletion fallback.
-If JJ forgets the workspace but only warns that directory deletion failed, jw reports
-the remaining path as a partial removal after cleaning bookmarks and lifecycle metadata.
+If the directory cannot be moved or deleted, jw reports the remaining path as a
+partial removal after cleaning bookmarks and lifecycle metadata.
 
 ### Colocated workspaces
 
@@ -341,7 +462,7 @@ runs a global Git worktree prune. Changed topology or missing/damaged provenance
 requires inspection instead of automatic deletion. Native app checkouts remain
 externally owned, including after adoption.
 
-For native removal, jw temporarily detaches only its validated Git link to prevent
+When forgetting, jw temporarily detaches only its validated Git link to prevent
 JJ's repository-wide pruning from deleting unrelated missing registrations, then
 cleans only the matching owned registration. A failed removal restores the link
 when the workspace is still registered; unverifiable outcomes retain lifecycle metadata

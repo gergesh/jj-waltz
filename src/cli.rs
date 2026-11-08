@@ -1,4 +1,4 @@
-use crate::config::{Config, DefaultCommand};
+use crate::config::{Config, CopyOnWrite, DefaultCommand};
 use crate::context;
 use crate::doctor::DoctorEngine;
 use crate::jj::JjClient;
@@ -6,6 +6,7 @@ use crate::lifecycle::{
     self, AdoptionRequest, BookmarkIntent, CreatedWorkspace, CreationPolicy, RepairRequest,
 };
 use crate::links;
+use crate::merge::{self, MergeRequest};
 use crate::observe::{ObservationEngine, RefreshMode, resolve_workspace_token};
 use crate::shell::{self, Shell};
 use crate::snapshot::{SnapshotEnvelope, WorkingCopyStatus};
@@ -18,7 +19,7 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Parser)]
@@ -63,12 +64,17 @@ enum Commands {
     Path(PathCommand),
     #[command(alias = "rm", about = "Forget a workspace")]
     Remove(RemoveCommand),
+    #[command(about = "Land a workspace before your @ or onto a bookmark, then remove it")]
+    Merge(MergeCommand),
     #[command(about = "Forget missing workspaces")]
     Prune,
     #[command(
         about = "Reconcile an external workspace after its owner removed checkout and Git registration"
     )]
     ReconcileExternal { name: String },
+    /// Internal: delete a directory that `jw remove` renamed aside. Runs detached.
+    #[command(name = workspace::PURGE_RETIRED_COMMAND, hide = true)]
+    PurgeRetiredDirectory { path: PathBuf },
     #[command(about = "Print the current workspace root")]
     Root,
     #[command(about = "Print the current workspace name")]
@@ -114,10 +120,17 @@ struct AddCommand {
     #[arg(
         long,
         action = ArgAction::SetTrue,
-        conflicts_with = "no_cow",
-        help = "Clone new workspace files from the current workspace with copy-on-write"
+        conflicts_with_all = ["cow_all", "no_cow"],
+        help = "Clone the current workspace's tracked files into a new workspace with copy-on-write"
     )]
     cow: bool,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        conflicts_with = "no_cow",
+        help = "Clone everything in the current workspace, including ignored files such as node_modules, with copy-on-write"
+    )]
+    cow_all: bool,
     #[arg(
         long,
         action = ArgAction::SetTrue,
@@ -182,10 +195,17 @@ struct SwitchCommand {
     #[arg(
         long,
         action = ArgAction::SetTrue,
-        conflicts_with = "no_cow",
-        help = "Clone new workspace files from the current workspace with copy-on-write"
+        conflicts_with_all = ["cow_all", "no_cow"],
+        help = "Clone the current workspace's tracked files into a new workspace with copy-on-write"
     )]
     cow: bool,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        conflicts_with = "no_cow",
+        help = "Clone everything in the current workspace, including ignored files such as node_modules, with copy-on-write"
+    )]
+    cow_all: bool,
     #[arg(
         long,
         action = ArgAction::SetTrue,
@@ -389,6 +409,53 @@ struct RemoveCommand {
 }
 
 #[derive(Debug, Args)]
+struct MergeCommand {
+    #[arg(
+        value_name = "WORKSPACE",
+        help = "Workspace to land [default: the current workspace, into the default workspace]",
+        add = ArgValueCompleter::new(complete_workspaces)
+    )]
+    workspace: Option<String>,
+    #[arg(
+        short,
+        long,
+        value_name = "BOOKMARK",
+        help = "Rebase onto a local bookmark and advance it [default: insert before the current workspace's @]",
+        add = ArgValueCompleter::new(complete_merge_targets)
+    )]
+    into: Option<String>,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Squash the workspace's revisions into one before landing"
+    )]
+    squash: bool,
+    #[arg(
+        long,
+        requires = "into",
+        action = ArgAction::SetTrue,
+        help = "Push the --into bookmark after landing"
+    )]
+    push: bool,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Forget the workspace but keep its directory, including untracked files"
+    )]
+    keep_dir: bool,
+    #[arg(
+        short,
+        long,
+        conflicts_with = "keep_dir",
+        action = ArgAction::SetTrue,
+        help = "Delete the directory even when it holds untracked files that would be lost"
+    )]
+    force: bool,
+    #[arg(long, hide = true, action = ArgAction::SetTrue)]
+    print_path: bool,
+}
+
+#[derive(Debug, Args)]
 struct CompletionCommand {
     #[arg(value_enum)]
     shell: Shell,
@@ -431,12 +498,14 @@ pub fn run() -> Result<()> {
         Commands::Repair(cmd) => run_repair(cmd),
         Commands::Path(cmd) => run_path(cmd),
         Commands::Remove(cmd) => run_remove(cmd),
+        Commands::Merge(cmd) => run_merge(cmd),
         Commands::Prune => run_prune(),
         Commands::ReconcileExternal { name } => {
             crate::ownership::reconcile(&name)?;
             println!("Reconciled external workspace: {name}; commits and bookmarks retained");
             Ok(())
         }
+        Commands::PurgeRetiredDirectory { path } => workspace::purge_retired_directory(&path),
         Commands::Root => {
             workspace::workspace_root_current().and_then(|root| print_line(root.display()))
         }
@@ -634,7 +703,7 @@ fn run_add(cmd: AddCommand) -> Result<()> {
         cmd.bookmark,
         cmd.no_bookmark,
         cmd.no_links,
-        copy_on_write_override(cmd.cow, cmd.no_cow),
+        copy_on_write_override(cmd.cow, cmd.cow_all, cmd.no_cow),
         cmd.names.len(),
     )?
     .with_colocation_override(if cmd.colocate {
@@ -663,7 +732,7 @@ fn run_switch(cmd: SwitchCommand) -> Result<()> {
         cmd.bookmark,
         cmd.no_bookmark,
         cmd.no_links,
-        copy_on_write_override(cmd.cow, cmd.no_cow),
+        copy_on_write_override(cmd.cow, cmd.cow_all, cmd.no_cow),
         cmd.names.len(),
     )?
     .with_colocation_override(if cmd.colocate {
@@ -716,10 +785,11 @@ fn print_switch_path(result: &workspace::SwitchResult) -> Result<()> {
     print_line(path.display())
 }
 
-fn copy_on_write_override(cow: bool, no_cow: bool) -> Option<bool> {
-    match (cow, no_cow) {
-        (true, _) => Some(true),
-        (_, true) => Some(false),
+fn copy_on_write_override(cow: bool, cow_all: bool, no_cow: bool) -> Option<CopyOnWrite> {
+    match (cow, cow_all, no_cow) {
+        (true, _, _) => Some(CopyOnWrite::Tracked),
+        (_, true, _) => Some(CopyOnWrite::All),
+        (_, _, true) => Some(CopyOnWrite::Off),
         _ => None,
     }
 }
@@ -1064,13 +1134,60 @@ fn prompt_delete_bookmarks(bookmarks: &[String]) -> Result<bool> {
 }
 
 fn print_remove_result(result: &workspace::RemovalResult) {
-    println!("Forgot workspace: {}", result.workspace);
+    print!("{}", render_remove_result(result));
+}
+
+fn render_remove_result(result: &workspace::RemovalResult) -> String {
+    let mut output = String::new();
+    writeln!(output, "Forgot workspace: {}", result.workspace).expect("write string");
     if result.deleted_dir {
-        println!("Deleted directory: {}", result.path.display());
+        writeln!(output, "Deleted directory: {}", result.path.display()).expect("write string");
     }
     for bookmark in &result.deleted_bookmarks {
-        println!("Deleted bookmark: {bookmark}");
+        writeln!(output, "Deleted bookmark: {bookmark}").expect("write string");
     }
+    output
+}
+
+fn run_merge(cmd: MergeCommand) -> Result<()> {
+    let outcome = merge::merge_workspace(&MergeRequest {
+        workspace: cmd.workspace,
+        into: cmd.into,
+        squash: cmd.squash,
+        push: cmd.push,
+        keep_dir: cmd.keep_dir,
+        force: cmd.force,
+    })?;
+    print_warnings(&outcome.warnings);
+    let mut report = String::new();
+    match outcome.landed {
+        0 => writeln!(
+            report,
+            "Workspace {} was already in {}",
+            outcome.workspace, outcome.target
+        ),
+        landed => writeln!(
+            report,
+            "Landed workspace {} into {}: {landed} revision(s){}",
+            outcome.workspace,
+            outcome.target,
+            if outcome.squashed { ", squashed" } else { "" }
+        ),
+    }
+    .expect("write string");
+    if outcome.pushed {
+        writeln!(report, "Pushed {}", outcome.target).expect("write string");
+    }
+    report.push_str(&render_remove_result(&outcome.removal));
+
+    // Shell adapters capture stdout as the destination of the removed workspace's shell.
+    if cmd.print_path {
+        eprint!("{report}");
+        return print_line(outcome.destination.display());
+    }
+    print!("{report}");
+    println!("  path: {}", outcome.destination.display());
+    Ok(())
 }
 
 fn run_prune() -> Result<()> {
@@ -1160,11 +1277,27 @@ fn print_line(value: impl std::fmt::Display) -> Result<()> {
 }
 
 fn complete_workspaces(current: &OsStr) -> Vec<CompletionCandidate> {
+    complete_from(
+        current,
+        "workspaces",
+        workspace::completion_workspace_candidates(),
+    )
+}
+
+fn complete_merge_targets(current: &OsStr) -> Vec<CompletionCandidate> {
+    complete_from(current, "bookmarks", merge::completion_target_candidates())
+}
+
+fn complete_from(
+    current: &OsStr,
+    kind: &str,
+    candidates: Result<Vec<(String, String)>>,
+) -> Vec<CompletionCandidate> {
     let current = current.to_string_lossy();
-    let candidates = match workspace::completion_workspace_candidates() {
+    let candidates = match candidates {
         Ok(candidates) => candidates,
         Err(error) => {
-            eprintln!("jw: failed to complete workspaces: {error:#}");
+            eprintln!("jw: failed to complete {kind}: {error:#}");
             return Vec::new();
         }
     };

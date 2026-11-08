@@ -53,10 +53,29 @@ operation diff matches the intended repair.
 ## Copy-on-write creation
 
 `jw add --cow` and `jw switch --cow` clone the current workspace's tracked files
-into the new workspace on APFS, Btrfs, or XFS. `workspace.copy_on_write = true`
-makes it the default; `--no-cow` opts out. The result matches a full checkout of
-the creation base: ignored and untracked files are not carried over. A warning on
-stderr means the filesystem could not clone and a full checkout was used.
+into the new workspace on APFS, Btrfs, or XFS. `--cow-all` also clones ignored and
+untracked files such as `node_modules` and `.env`.
+`workspace.copy_on_write = "tracked"` (or `true`) or `"all"` makes it the default;
+`--no-cow` opts out. Tracked files match a full checkout of the creation base, and
+uncommitted edits, including untracked files JJ would snapshot, never carry over.
+
+Choosing between workspace links and `--cow-all`:
+
+- Links share one mutable target: writes from any workspace are seen by all. Use
+  them for large shared data or caches.
+- `--cow-all` gives each workspace an independently writable copy. Use it for
+  per-branch dependencies and build output such as `node_modules`.
+- With `--cow-all`, a link source is not cloned when its target exists outside
+  the new workspace (the link supplies it). Private overrides whose target is the
+  source itself are cloned. A source with a missing optional target is skipped
+  with a warning, since a private copy there would be a link conflict.
+- `--cow-all` copies secrets such as `.env` into every new workspace as
+  independent files, and copies symlinks verbatim: relative ones resolve from the
+  new workspace, absolute ones keep their old target.
+
+A warning on stderr that copy-on-write is unavailable means a full checkout was
+used. Watchman or a rejected working-copy state also fall back silently. Any
+fallback is an ordinary checkout, so `--cow-all` then carries no ignored files.
 
 ## Adopt
 
@@ -113,6 +132,27 @@ Do not bypass this with native JJ/Git cleanup or a gardener; use the owning app.
 - Associated bookmarks prompt by default. Use `--keep-bookmark` or `--delete-bookmark` to make the user's choice explicit for non-interactive work.
 
 Complete removal when `jw list` no longer contains the workspace and the directory and bookmarks match the chosen preservation policy.
+
+## Merge
+
+Run `jw merge` only when the user asks to land a workspace. It lands the workspace's
+stack (before the receiving `@`, or onto `--into <bookmark>`), then forgets the
+workspace and deletes its directory.
+
+- It deletes the associated bookmark only when it points into the landed stack; trunk,
+  the `--into` target, and bookmarks pointing elsewhere are kept with a warning.
+- Only untracked files covered by a `# jw:trash` section of an ignore file are deleted
+  with the directory. A section starts at a `# jw:trash` line and ends at the next blank
+  line or `# jw:` line. A `# jw:trash-rules <path>` line in a `.gitignore` adopts a nested
+  `.gitignore` below it, path relative to its own directory, making all of that file's
+  rules trash; use it for ignore files a tool writes, which cannot keep a marker.
+- It refuses, changing nothing, when the directory holds any other untracked file, ignored
+  or not, without an identical copy at the same path in the default workspace. Show the
+  listed files and rules to the user. Move a pattern into a trash section, or adopt a
+  tool's ignore file, only when the user confirms its files are regenerable; pass `--keep-dir` only when they want the
+  directory kept, and never delete those files without asking. `--force` deletes the directory with every listed
+  file; pass it only when the user explicitly confirms those files may be lost.
+- Conflicts or a failed `--push` keep the workspace; resolve and rerun.
 
 ## Prune
 

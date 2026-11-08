@@ -18,7 +18,10 @@ work. The current command surface remains authoritative in `jw --help`.
 | `gh` / `glab` | Pull or merge requests, forge checks, and CI state |
 
 `jw` may coordinate a graph or publication step through `jj`, but it does not add
-general wrappers for ordinary JJ verbs. Forge and network adapters are optional;
+general wrappers for ordinary JJ verbs. `jw merge` is that coordination for landing: a fixed
+snapshot, optional squash, insertion before a working copy or rebase and fast-forward
+of an explicit bookmark, optional push, and removal,
+with removal planned before the first rewrite. Forge and network adapters are optional;
 core creation, switching, inventory, local status, links, and removal stay
 offline.
 
@@ -37,9 +40,28 @@ offline.
 - `metadata` persists repository-scoped managed-workspace intent.
 - `doctor` runs independent read-only checks and always produces a complete report,
   including configured-link health for every managed workspace.
+- `merge` owns the landing workflow. It selects the publish tip and stack, refuses
+  merges and conflicts, and reuses `workspace` removal planning and execution. Before
+  any rewrite it decides which associated bookmarks point into the landed stack (only
+  those are deleted; trunk and the `--into` target never are) and, unless the directory
+  is kept or `--force` is passed, refuses when `unpreserved` finds untracked files only
+  that checkout has.
+- `unpreserved` walks a checkout's untracked entries (everything not in the snapshot's
+  tracked file list) and reports those a directory deletion would lose: not trash, and
+  with no identical copy (same size and modification time, else same bytes) at the same
+  path in a reference checkout. Trash directories are never entered, a directory is
+  decided whole by the rule that decides it, and symlinks are skipped.
+- `trash` classifies untracked paths with one batched `git check-ignore --verbose` per
+  walk level, against the repository's Git directory with the checkout as work tree.
+  A path is trash only when the deciding pattern sits in a `# jw:trash` section of its
+  ignore file, or in a nested `.gitignore` that a `# jw:trash-rules <path>` line in a
+  `.gitignore` above it adopts; unmarked rules, negations, and unignored paths are
+  precious.
 - `workspace` owns Jujutsu workspace discovery and mutation. Its inventory gives
   commands one consistent view; removal is planned before execution.
-- `cow` owns copy-on-write file cloning and filesystem capability probing. The
+- `cow` owns copy-on-write cloning, planned as maximal whole-directory clones of
+  the selected entries (tracked files, or everything but JJ/Git metadata and
+  link sources), and filesystem capability probing. The
   `workspace` module orchestrates JJ adoption of the clone. The `jj` adapter owns
   listing tracked files and reading and writing JJ's local working-copy state,
   which is not a public interface: every copied state is validated by JJ and
@@ -96,6 +118,17 @@ render once
 Refresh may be current, selected/all, or none. Skipping it trades freshness for
 speed and must be represented in output. No status derivation may trigger another
 implicit JJ operation after capture.
+
+The number of JJ processes a command starts must not grow with the number of
+workspaces. Facts about every workspace come from one batched query each: names
+and roots from one `workspace list`, targets from another, creation bases, bookmark
+targets, and trunk ancestry from one `log` each. Per-workspace queries are allowed
+only where JJ offers no batch form: snapshotting each explicitly refreshed working
+copy, and reading roots on JJ releases without `WorkspaceRef.root()` (0.39) or the
+path of a deleted checkout before JJ 0.46. Diff statistics read file contents, so
+they are queried only for refreshed, modified working copies. Trunk ancestry is
+answered by JJ (`contained_in("::trunk")`) for the inspected revisions only, so its
+cost does not grow with history either. `tests/scaling.rs` enforces this.
 
 All JJ process execution belongs behind the central `jj::JjClient` adapter. It
 owns safe argument passing, color/pager policy, parsed version and capability
@@ -209,7 +242,10 @@ identities are blocked. Risky rows require explicit inclusion. For eligible rows
 with unrecorded content, the preview requires a batch choice to delete that content
 or skip those workspaces before execution. The final check compares filesystem identity,
 workspace revision, metadata, bookmark targets, and ignored-file inventory with
-the reviewed plan. Changed targets require another review. Independent targets
+the reviewed plan. One capture refreshes and revalidates every runnable row; each
+row's live ownership, path identity, and content checks still run immediately before
+that row's mutation. If the batch capture fails, for example because a target vanished,
+rows are revalidated one at a time. Changed targets require another review. Independent targets
 continue after failure, and outcomes describe any partial progress. A directory
 removal is permanent; JJ history cannot restore unrecorded files.
 
@@ -275,9 +311,21 @@ health field to `jw status`.
 
 When copy-on-write is requested, creation probes the destination filesystem before
 any mutation and falls back to ordinary JJ workspace creation with a warning if it cannot clone.
-Otherwise it adds the workspace with empty sparse patterns, clones the files JJ
-tracks in the current workspace's working-copy commit, and copies the current
-workspace's working-copy state. Ignored and untracked files are never cloned.
+Otherwise it adds the workspace with empty sparse patterns, clones the selected
+entries of the current workspace, and copies the current workspace's working-copy
+state. The default `tracked` scope selects the files JJ tracks in the current
+workspace's working-copy commit; ignored and untracked files are never cloned.
+The `all` scope selects every entry except `.jj`, `.git`, and the link sources
+that links will supply: those whose target already exists outside the new
+workspace. Sources with a missing optional target are skipped with a warning,
+because a private copy at a link source is a link conflict; private overrides
+targeting the new workspace itself are cloned.
+The clone is planned as maximal subtrees: a directory whose entries are all
+selected is cloned with one call (one `clonefile(2)` on macOS), and only
+directories mixing selected and unselected entries are walked further.
+Because the source can change between planning and cloning, each whole-directory
+clone is then pruned back to the selection, so a file created in the gap, such as
+an ignored build artifact, cannot survive in a tracked-only clone.
 A JJ snapshot validates the copied state; if JJ rejects it, the previous state is
 restored, the attempted clone workspace is rolled back, and JJ recreates it
 through its ordinary workspace-add path, preserving the source sparse patterns.
@@ -328,7 +376,7 @@ records remain readable. Adoption and registration inspect actual topology; repa
 preserves ownership. Older or absent records still receive live topology checks.
 
 CLI removal, manager preview and execution, pruning, and rollback revalidate ownership
-before native `workspace remove` or `workspace forget`. An externally owned linked
+before `workspace forget`. An externally owned linked
 Git checkout or remaining external Git registration is
 ineligible for destructive cleanup; uncertainty fails closed. A native app owns its
 checkout even after JJ adoption. Creation resolves CLI overrides, explicit jw config,
@@ -341,14 +389,28 @@ This is a breaking creation-default change in v0.8.0. Set
 `workspace.colocate = false` or pass `--no-colocate` to preserve the previous
 JJ-only creation behavior; automatic CoW remains JJ-only.
 
-Existing-directory removal probes `workspace remove --help` and uses native
-snapshotting/removal when advertised (JJ 0.46+); minimum support remains JJ 0.39.
-Keep-directory, missing-directory, rollback, and older-JJ cleanup retain guarded
-forgetting. Both commands share the owned Git-link detachment and exact-registration
-cleanup boundary, preventing JJ 0.46's global prune from touching unrelated missing
-registrations. Workspace absence is verified even after command failure; native
-removal never retries through custom deletion. A remaining directory is reported as
-partial progress after bookmark/metadata cleanup, including JJ's warning-only failures.
+Existing-directory removal snapshots the target working copy first, so its tracked and
+new files survive in the workspace's last commit; a stale working copy refuses removal
+before any mutation. It then uses guarded forgetting, the same path as keep-directory,
+missing-directory, and rollback cleanup. Native `workspace remove` is not used: it
+deletes the checkout synchronously, which takes seconds for large dependency trees.
+Forgetting shares the owned Git-link detachment and exact-registration cleanup
+boundary, preventing JJ 0.46's global prune from touching unrelated missing
+registrations. Workspace absence is verified even after command failure.
+
+After forgetting, the directory is renamed to a hidden `.<name>.jw-retired-*` sibling
+on the same filesystem, so its path disappears immediately, and a detached
+`jw __purge-retired-directory` process deletes it. The purge accepts only directories
+with that marker and never follows a symlink. If the rename or the purge process cannot
+start, the directory is deleted synchronously instead. A directory that cannot be
+removed is reported as partial progress after bookmark/metadata cleanup.
+
+Ownership checks read repository facts (recorded roots, the Git backend, linked
+registrations) through `ownership::OwnershipView` at most once per command phase. A
+fresh view is built immediately before each destructive boundary. Pruning validates
+every missing workspace and forgets them with one `jj workspace forget`; if any target
+is refused, none is forgotten. Verifying a colocated checkout's live topology still
+costs one `git rev-parse` per checkout.
 
 `reconcile-external` is separate from automatic pruning. It verifies that the recorded
 checkout and Git admin directory are absent and the live registration is gone,
