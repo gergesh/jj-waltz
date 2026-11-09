@@ -1,3 +1,4 @@
+use crate::config;
 use crate::cow;
 use crate::jj::{self, JjClient};
 use crate::metadata::{ManagedWorkspaceMetadata, WorkspaceMetadataStore};
@@ -65,6 +66,7 @@ pub struct WorkspaceInventory {
     previous_error: Option<String>,
     default: Option<String>,
     current_root: PathBuf,
+    directory_template: String,
 }
 
 impl WorkspaceInventory {
@@ -150,7 +152,12 @@ impl WorkspaceInventory {
             previous_error,
             default,
             current_root,
+            directory_template: config::DEFAULT_DIRECTORY_TEMPLATE.to_owned(),
         })
+    }
+
+    pub fn set_directory_template(&mut self, template: String) {
+        self.directory_template = template;
     }
 
     pub fn entries(&self) -> &[WorkspaceEntry] {
@@ -563,6 +570,7 @@ fn add_workspace_by_name_with_inventory(
     validate_workspace_name(name)?;
     let path = workspace_dir_for_name(name, inventory)?;
     require_absent_workspace_path(&path)?;
+    ensure_workspace_parent(&path)?;
 
     let mut args = vec![
         "workspace".to_owned(),
@@ -756,6 +764,15 @@ fn rollback_failed_add(
         Ok(()) => error,
         Err(cleanup) => error.context(format!("cleanup also failed: {cleanup}")),
     }
+}
+
+/// JJ does not create missing parents, which `--directory` can name.
+pub(crate) fn ensure_workspace_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("workspace path has no parent directory"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("cannot create workspace directory {}", parent.display()))
 }
 
 fn require_absent_workspace_path(path: &Path) -> Result<()> {
@@ -973,17 +990,21 @@ pub(crate) fn workspace_dir_for_name(
     name: &str,
     inventory: &WorkspaceInventory,
 ) -> Result<PathBuf> {
-    let default_root = workspace_base_root(inventory.current_root(), inventory.current_name())?;
+    // A recorded default root stays correct when the current workspace lives in a
+    // directory that `--directory` placed anywhere, not beside the default.
+    let default_root = match inventory
+        .entries
+        .iter()
+        .find(|entry| entry.name == "default")
+        .and_then(|entry| entry.root.clone())
+    {
+        Some(root) => root,
+        None => workspace_base_root(inventory.current_root(), inventory.current_name())?,
+    };
     if name == "default" {
         Ok(default_root)
     } else {
-        let parent = default_root
-            .parent()
-            .ok_or_else(|| anyhow!("workspace root has no parent directory"))?;
-        let base_name = default_root
-            .file_name()
-            .ok_or_else(|| anyhow!("workspace root has no valid basename"))?;
-        Ok(parent.join(format!("{}.{name}", base_name.to_string_lossy())))
+        config::workspace_directory(&inventory.directory_template, &default_root, name)
     }
 }
 

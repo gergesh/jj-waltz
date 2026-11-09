@@ -132,6 +132,12 @@ struct AddCommand {
     colocate: bool,
     #[arg(long, help = "Override workspace.colocate for new workspaces")]
     no_colocate: bool,
+    #[arg(
+        long,
+        value_name = "TEMPLATE",
+        help = "Create new workspaces at this path template (default {parent}/{repo}.{workspace}); supports {parent}, {repo} and {workspace}"
+    )]
+    directory: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -194,6 +200,12 @@ struct SwitchCommand {
     colocate: bool,
     #[arg(long, help = "Override workspace.colocate for new workspaces")]
     no_colocate: bool,
+    #[arg(
+        long,
+        value_name = "TEMPLATE",
+        help = "Create new workspaces at this path template (default {parent}/{repo}.{workspace}); supports {parent}, {repo} and {workspace}"
+    )]
+    directory: Option<String>,
     #[arg(last = true)]
     execute_args: Vec<String>,
 }
@@ -631,7 +643,8 @@ fn run_add(cmd: AddCommand) -> Result<()> {
         Some(false)
     } else {
         None
-    });
+    })
+    .with_directory_override(cmd.directory);
     let outcome = lifecycle::add_workspaces(&cmd.names, &policy)?;
     print_warnings(&outcome.warnings);
     for created in &outcome.created {
@@ -659,7 +672,8 @@ fn run_switch(cmd: SwitchCommand) -> Result<()> {
         Some(false)
     } else {
         None
-    });
+    })
+    .with_directory_override(cmd.directory);
     let outcome = lifecycle::switch_workspaces(&cmd.names, &policy)?;
     print_warnings(&outcome.warnings);
     for created in &outcome.intermediate {

@@ -18,6 +18,7 @@ pub struct CreationPolicy {
     copy_on_write: bool,
     config: Config,
     colocate_override: Option<bool>,
+    directory_override: Option<String>,
 }
 
 impl CreationPolicy {
@@ -45,12 +46,25 @@ impl CreationPolicy {
             copy_on_write: copy_on_write.unwrap_or(config.workspace.copy_on_write),
             config,
             colocate_override: None,
+            directory_override: None,
         })
     }
 
     pub fn with_colocation_override(mut self, value: Option<bool>) -> Self {
         self.colocate_override = value;
         self
+    }
+
+    pub fn with_directory_override(mut self, value: Option<String>) -> Self {
+        self.directory_override = value;
+        self
+    }
+
+    /// Where new workspaces go: `--directory`, else beside the default workspace.
+    fn directory_template(&self) -> String {
+        self.directory_override
+            .clone()
+            .unwrap_or_else(|| config::DEFAULT_DIRECTORY_TEMPLATE.to_owned())
     }
 
     fn preflight_colocation(&self, client: &JjClient) -> Result<bool> {
@@ -174,6 +188,7 @@ impl PendingWorkspace {
 
 pub fn add_workspaces(names: &[String], policy: &CreationPolicy) -> Result<AddOutcome> {
     let mut inventory = workspace::WorkspaceInventory::load()?;
+    inventory.set_directory_template(policy.directory_template());
     let resolved_names = names
         .iter()
         .map(|name| inventory.resolve(name))
@@ -247,6 +262,7 @@ fn switch_workspaces_with_creation(
         .split_last()
         .ok_or_else(|| anyhow!("at least one workspace name is required"))?;
     let mut inventory = workspace::WorkspaceInventory::load()?;
+    inventory.set_directory_template(policy.directory_template());
 
     // Resolve every token and validate every creation before mutating repository state.
     let resolved_intermediate = intermediate_names
@@ -645,6 +661,7 @@ fn plan_checkout(
     let destination_parent = destination
         .parent()
         .ok_or_else(|| anyhow!("workspace path has no parent directory"))?;
+    workspace::ensure_workspace_parent(&destination)?;
     Ok(
         match cow::unsupported_reason(source_root, destination_parent) {
             Some(reason) => CheckoutPlan {

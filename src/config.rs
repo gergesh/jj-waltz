@@ -2,11 +2,13 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const CONFIG_DIR: &str = "jj-waltz";
 const CONFIG_FILE: &str = "config.toml";
 const DEFAULT_BOOKMARK_TEMPLATE: &str = "{workspace}";
+/// Sibling of the default workspace: `<parent>/<repo>.<workspace>`.
+pub const DEFAULT_DIRECTORY_TEMPLATE: &str = "{parent}/{repo}.{workspace}";
 const DEFAULT_TRUNK_REVSET: &str = "trunk()";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +125,51 @@ pub fn bookmark_from_template(template: &str, workspace: &str) -> String {
     template.replace("{workspace}", workspace)
 }
 
+/// Expands a `--directory` template for one new workspace.
+///
+/// `{parent}` and `{repo}` are the parent directory and basename of the default
+/// workspace, and `{workspace}` is the new workspace's name. A leading `~` is the home
+/// directory, and a relative result is resolved against `{parent}`.
+pub fn workspace_directory(
+    template: &str,
+    default_root: &Path,
+    workspace: &str,
+) -> Result<PathBuf> {
+    let parent = default_root
+        .parent()
+        .context("workspace root has no parent directory")?;
+    let repo = default_root
+        .file_name()
+        .context("workspace root has no valid basename")?;
+    let expanded = template
+        .replace("{parent}", &parent.to_string_lossy())
+        .replace("{repo}", &repo.to_string_lossy())
+        .replace("{workspace}", workspace);
+    if expanded.contains(['{', '}']) {
+        anyhow::bail!(
+            "--directory {template:?} has an unknown token; \
+             supported tokens are {{parent}}, {{repo}} and {{workspace}}"
+        )
+    }
+
+    let path = if expanded == "~" || expanded.starts_with("~/") {
+        let home =
+            env::var_os("HOME").context("--directory starts with `~` but HOME is not set")?;
+        PathBuf::from(home).join(expanded.trim_start_matches('~').trim_start_matches('/'))
+    } else {
+        PathBuf::from(&expanded)
+    };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        parent.join(path)
+    };
+    if path.parent().is_none() {
+        anyhow::bail!("--directory {template:?} resolves to the filesystem root")
+    }
+    Ok(path)
+}
+
 fn config_path() -> Result<Option<PathBuf>> {
     let config_home = if let Some(value) = env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(value)
@@ -211,6 +258,48 @@ mod tests {
         let raw: RawConfig = toml::from_str("[trunk]").unwrap();
 
         assert_eq!(Config::from(raw).trunk.revset, "trunk()");
+    }
+
+    #[test]
+    fn default_directory_is_a_sibling_of_the_default_workspace() {
+        assert_eq!(
+            workspace_directory(
+                DEFAULT_DIRECTORY_TEMPLATE,
+                Path::new("/work/app"),
+                "feature-a"
+            )
+            .unwrap(),
+            Path::new("/work/app.feature-a")
+        );
+    }
+
+    #[test]
+    fn directory_template_supports_tokens_relative_and_home_paths() {
+        let root = Path::new("/work/app");
+        let expand = |template| workspace_directory(template, root, "ws").unwrap();
+
+        assert_eq!(
+            expand("{parent}/{repo}-workspaces/{workspace}"),
+            Path::new("/work/app-workspaces/ws")
+        );
+        assert_eq!(
+            expand("{repo}-trees/{workspace}"),
+            Path::new("/work/app-trees/ws")
+        );
+        assert_eq!(expand("/srv/{repo}/{workspace}"), Path::new("/srv/app/ws"));
+        let home = PathBuf::from(env::var_os("HOME").unwrap());
+        assert_eq!(
+            expand("~/trees/{repo}/{workspace}"),
+            home.join("trees/app/ws")
+        );
+    }
+
+    #[test]
+    fn directory_template_rejects_unknown_tokens() {
+        let error = workspace_directory("{parent}/{nope}", Path::new("/work/app"), "ws")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown token"), "{error}");
     }
 
     #[test]

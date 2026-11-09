@@ -360,6 +360,22 @@ Automatic inheritance chooses JJ-only when copy-on-write is selected, including
 through global config. Explicit colocation and copy-on-write cannot be combined.
 Use `--no-cow` or `--no-colocate` to override one configured option for a command.
 
+## Workspace location
+
+New workspaces are created next to the default workspace as `<repo>.<workspace>`.
+`jw add` and `jw switch` accept `--directory <TEMPLATE>` to put them elsewhere:
+
+```sh
+jw add feature --directory '~/trees/{repo}/{workspace}'
+```
+
+`{parent}` and `{repo}` are the parent directory and basename of the default workspace,
+and `{workspace}` is the new workspace's name. The default is
+`{parent}/{repo}.{workspace}`. A leading `~` is your home directory, and a relative
+path resolves against `{parent}`. Missing parent directories are created, existing
+workspaces stay where they are, and unknown `{tokens}` are an error. There is no
+global setting, so a per-project script or alias supplies the flag.
+
 
 ## Config
 

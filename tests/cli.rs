@@ -96,6 +96,79 @@ fn add_creates_multiple_workspaces_without_switching() {
 }
 
 #[test]
+fn directory_flag_places_new_workspaces_and_survives_creation_from_them() {
+    skip_without_jj!();
+    let repo = TestRepo::new().expect("create test repo");
+    let trees = repo.default_root.parent().unwrap().join("repo-trees");
+    let template = "{parent}/{repo}-trees/{workspace}";
+
+    repo.cmd()
+        .args(["add", "feature-a", "--directory", template])
+        .assert()
+        .success();
+    assert!(trees.join("feature-a").is_dir());
+    assert!(!repo.default_root.with_extension("feature-a").exists());
+
+    // The default workspace is still found when the current one is not its sibling.
+    repo.cmd_at(&trees.join("feature-a"))
+        .args(["add", "feature-b", "--directory", template])
+        .assert()
+        .success();
+    assert!(trees.join("feature-b").is_dir());
+
+    repo.cmd()
+        .args(["path", "feature-b"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            trees.join("feature-b").to_str().unwrap(),
+        ));
+}
+
+#[test]
+fn directory_flag_applies_to_add_and_switch() {
+    skip_without_jj!();
+    let repo = TestRepo::new().expect("create test repo");
+    let parent = repo.default_root.parent().unwrap();
+
+    repo.cmd()
+        .args([
+            "add",
+            "feature-a",
+            "--directory",
+            "{parent}/flag/{workspace}",
+        ])
+        .assert()
+        .success();
+    repo.cmd()
+        .args([
+            "switch",
+            "feature-b",
+            "--directory",
+            "{parent}/flag/{workspace}",
+        ])
+        .assert()
+        .success();
+
+    assert!(parent.join("flag/feature-a").is_dir());
+    assert!(parent.join("flag/feature-b").is_dir());
+    assert!(!repo.default_root.with_extension("feature-a").exists());
+}
+
+#[test]
+fn unknown_directory_token_fails_before_creating_anything() {
+    skip_without_jj!();
+    let repo = TestRepo::new().expect("create test repo");
+
+    repo.cmd()
+        .args(["add", "feature-a", "--directory", "{parent}/{nope}"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown token"));
+    assert!(!repo.default_root.with_extension("feature-a").exists());
+}
+
+#[test]
 fn add_rolls_back_earlier_workspaces_when_later_token_resolution_fails() {
     skip_without_jj!();
     let repo = TestRepo::new().expect("create test repo");
